@@ -1,0 +1,444 @@
+{
+  "name": "HTTP Request with Retry-After (Delta-Seconds & HTTP-Date)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## HTTP Request with Retry-After Loop\n1. **Config** initializes `url`, `method`, `maxAttempts` (5), `budgetSeconds` (60), and `attempt` (1).\n2. **HTTP Request** runs with **Include Response Headers and Status** and **Never Error** enabled so 429/503 responses reach the Code node.\n3. **Decide** parses `Retry-After` (delta-seconds or RFC 9110 IMF-fixdate) or falls back to exponential backoff with jitter.\n4. **Switch** routes `retry` -> **Wait** -> **Next attempt** (`attempt + 1`) -> **HTTP Request**.",
+        "height": 220,
+        "width": 560,
+        "color": 4
+      },
+      "id": "b7c0f101-0001-4000-8000-000000000001",
+      "name": "Sticky Note - Loop Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        180,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Exit Branches\n- **retry**: Delay is within `budgetSeconds`; waits in-workflow and loops.\n- **defer**: Delay exceeds `budgetSeconds`; re-queue to Redis/SQS/Postgres/Sub-workflow instead of holding the execution open.\n- **give_up**: `attempt > maxAttempts`; send an alert or log failure.\n- **done**: Status is not 429/503; continue normal processing.",
+        "height": 220,
+        "width": 480,
+        "color": 5
+      },
+      "id": "b7c0f101-0002-4000-8000-000000000002",
+      "name": "Sticky Note - Exit Branches",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        820,
+        80
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "b7c0f101-0003-4000-8000-000000000003",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        180,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "cfg-url",
+              "name": "url",
+              "value": "https://httpbin.org/status/429",
+              "type": "string"
+            },
+            {
+              "id": "cfg-method",
+              "name": "method",
+              "value": "GET",
+              "type": "string"
+            },
+            {
+              "id": "cfg-max-attempts",
+              "name": "maxAttempts",
+              "value": 5,
+              "type": "number"
+            },
+            {
+              "id": "cfg-budget-seconds",
+              "name": "budgetSeconds",
+              "value": 60,
+              "type": "number"
+            },
+            {
+              "id": "cfg-attempt",
+              "name": "attempt",
+              "value": 1,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "b7c0f101-0004-4000-8000-000000000004",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        380,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "method": "={{ $json.method || 'GET' }}",
+        "url": "={{ $json.url }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "b7c0f101-0005-4000-8000-000000000005",
+      "name": "HTTP Request",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        600,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "function parseRetryAfter(value, nowMs = Date.now()) {\n  if (value === null || value === undefined) {\n    return null;\n  }\n\n  if (typeof value === 'number') {\n    if (!Number.isFinite(value) || value < 0) {\n      return null;\n    }\n    return Math.round(value * 1000);\n  }\n\n  if (typeof value !== 'string') {\n    return null;\n  }\n\n  const trimmed = value.trim();\n  if (trimmed === '') {\n    return null;\n  }\n\n  if (/^[+-]?\\d+(\\.\\d+)?$/.test(trimmed)) {\n    const seconds = Number(trimmed);\n    if (!Number.isFinite(seconds) || seconds < 0) {\n      return null;\n    }\n    return Math.round(seconds * 1000);\n  }\n\n  if (!/(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|\\d{4}-\\d{2}-\\d{2}/i.test(trimmed)) {\n    return null;\n  }\n\n  const targetMs = Date.parse(trimmed);\n  if (Number.isNaN(targetMs)) {\n    return null;\n  }\n\n  const diffMs = targetMs - nowMs;\n  return diffMs > 0 ? diffMs : 0;\n}\n\nfunction backoffMs(\n  attempt,\n  { baseMs = 1000, capMs = 60000, jitterRatio = 0.2, random = Math.random } = {}\n) {\n  const safeAttempt = Math.max(1, Number(attempt) || 1);\n  const delay = Math.min(capMs, baseMs * 2 ** (safeAttempt - 1));\n  const jitter = jitterRatio > 0 ? random() * jitterRatio * delay : 0;\n  return delay + jitter;\n}\n\nfunction getRetryAfterHeader(headers) {\n  if (!headers || typeof headers !== 'object') {\n    return null;\n  }\n\n  if (typeof headers.get === 'function') {\n    return headers.get('retry-after');\n  }\n\n  for (const key of Object.keys(headers)) {\n    if (key.toLowerCase() === 'retry-after') {\n      const raw = headers[key];\n      return Array.isArray(raw) ? raw[0] : raw;\n    }\n  }\n\n  return null;\n}\n\nfunction nextDelay({\n  status,\n  headers = {},\n  attempt = 1,\n  nowMs = Date.now(),\n  options = {},\n} = {}) {\n  const {\n    retryableStatuses = [429, 503],\n    maxAttempts = 5,\n    minMs = 0,\n    budgetMs = 60000,\n    baseMs = 1000,\n    capMs = 60000,\n    jitterRatio = 0.2,\n    random = Math.random,\n  } = options;\n\n  const numericStatus = Number(status);\n  if (!retryableStatuses.includes(numericStatus)) {\n    return {\n      action: 'done',\n      delayMs: 0,\n      reason: `status ${status} is not in retryable set [${retryableStatuses.join(', ')}]`,\n    };\n  }\n\n  const numericAttempt = Number(attempt);\n  if (numericAttempt > maxAttempts) {\n    return {\n      action: 'give_up',\n      delayMs: 0,\n      reason: `attempt ${numericAttempt} exceeds maxAttempts ${maxAttempts}`,\n    };\n  }\n\n  const rawHeader = getRetryAfterHeader(headers);\n  const parsedHeaderMs = parseRetryAfter(rawHeader, nowMs);\n  const source = parsedHeaderMs !== null ? 'retry-after header' : 'exponential backoff';\n  const computedMs =\n    parsedHeaderMs !== null\n      ? parsedHeaderMs\n      : backoffMs(numericAttempt, { baseMs, capMs, jitterRatio, random });\n\n  const delayMs = Math.max(minMs, computedMs);\n\n  if (delayMs > budgetMs) {\n    return {\n      action: 'defer',\n      delayMs,\n      reason: `delay ${delayMs}ms (${source}) exceeds budget ${budgetMs}ms`,\n    };\n  }\n\n  return {\n    action: 'retry',\n    delayMs,\n    reason: `waiting ${delayMs}ms (${source}) before attempt ${numericAttempt + 1}`,\n  };\n}\n\nconst config = $('Config').first().json;\nlet attempt = Number(config.attempt ?? 1);\ntry {\n  if ($('Next attempt').isExecuted) {\n    const looped = $('Next attempt').last().json;\n    if (looped && looped.attempt !== undefined) {\n      attempt = Number(looped.attempt);\n    }\n  } else if ($json.attempt !== undefined) {\n    attempt = Number($json.attempt);\n  }\n} catch (_) {\n  if ($json.attempt !== undefined) {\n    attempt = Number($json.attempt);\n  }\n}\n\nconst statusCode = Number($json.statusCode ?? $json.status ?? 200);\nconst headers = $json.headers || {};\nconst maxAttempts = Number(config.maxAttempts ?? 5);\nconst budgetSeconds = Number(config.budgetSeconds ?? 60);\n\nconst decision = nextDelay({\n  status: statusCode,\n  headers,\n  attempt,\n  options: {\n    maxAttempts,\n    budgetMs: budgetSeconds * 1000,\n  },\n});\n\nreturn {\n  json: {\n    action: decision.action,\n    delayMs: decision.delayMs,\n    reason: decision.reason,\n    attempt,\n    url: config.url,\n    method: config.method || 'GET',\n    maxAttempts,\n    budgetSeconds,\n    statusCode,\n    headers,\n    body: $json.body ?? null,\n  },\n};\n"
+      },
+      "id": "b7c0f101-0006-4000-8000-000000000006",
+      "name": "Decide",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        820,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-retry",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "retry",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "retry"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-defer",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "defer",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "defer"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-give-up",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "give_up",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "give_up"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-done",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "done",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "done"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "b7c0f101-0007-4000-8000-000000000007",
+      "name": "Switch",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1040,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": "={{ Math.ceil($json.delayMs / 1000) }}",
+        "unit": "seconds"
+      },
+      "id": "b7c0f101-0008-4000-8000-000000000008",
+      "name": "Wait",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1300,
+        200
+      ],
+      "webhookId": "b7c0f101-0008-4000-8000-000000000008"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "next-url",
+              "name": "url",
+              "value": "={{ $json.url }}",
+              "type": "string"
+            },
+            {
+              "id": "next-method",
+              "name": "method",
+              "value": "={{ $json.method }}",
+              "type": "string"
+            },
+            {
+              "id": "next-max-attempts",
+              "name": "maxAttempts",
+              "value": "={{ $json.maxAttempts }}",
+              "type": "number"
+            },
+            {
+              "id": "next-budget-seconds",
+              "name": "budgetSeconds",
+              "value": "={{ $json.budgetSeconds }}",
+              "type": "number"
+            },
+            {
+              "id": "next-attempt",
+              "name": "attempt",
+              "value": "={{ $json.attempt + 1 }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "b7c0f101-0009-4000-8000-000000000009",
+      "name": "Next attempt",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1520,
+        200
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "b7c0f101-0010-4000-8000-000000000010",
+      "name": "Re-queue (connect your queue here)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        340
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "b7c0f101-0011-4000-8000-000000000011",
+      "name": "Give up (alert here)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        480
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "b7c0f101-0012-4000-8000-000000000012",
+      "name": "Done",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        620
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Re-queue (connect your queue here)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Give up (alert here)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Next attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Next attempt": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "n8n-retry-after",
+  "version": "0.1.0",
+  "description": "Parse HTTP Retry-After headers (delta-seconds and IMF-fixdate) with exponential backoff and budget-aware retry/defer decisions for n8n workflows.",
+  "main": "src/retryAfter.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "n8n",
+    "retry-after",
+    "rate-limit",
+    "http",
+    "backoff"
+  ],
+  "author": "Tran Trung Thanh",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
