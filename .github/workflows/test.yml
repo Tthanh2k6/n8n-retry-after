@@ -1,0 +1,18 @@
+name: test
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node --test
+      - name: Workflow JSON parses and Decide code runs
+        run: node -e "const w=require('./workflows/http-request-with-retry-after.json');const c=w.nodes.find(n=>n.name==='Decide').parameters.jsCode;const \$=()=>({first:()=>({json:{url:'u',maxAttempts:5,budgetSeconds:60,attempt:1}}),last:()=>({json:{}}),isExecuted:false});const r=new Function('\$','\$json',c)(\$,{statusCode:429,headers:{'Retry-After':'2'}});if(r.json.action!=='retry')process.exit(1)"
